@@ -1,0 +1,55 @@
+# Dependency directories
+node_modules/
+frontend/node_modules/
+
+# Production builds
+dist/
+frontend/dist/
+dist-ssr/
+frontend/dist-ssr/
+
+# Python cache and execution outputs
+__pycache__/
+backend/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+
+# Environment configurations (API keys & Secrets)
+.env
+.env.local
+.env.*.local
+backend/.env
+
+# Local database file fallback data (exclude the template dataset)
+backend/data/*.json
+# (Allow the synthetic career recommendation csv)
+!backend/data/career_data.csv
+
+# User uploaded files
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Temporary exploration folders
+extracted_inspiration/
+
+# Log files
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor specific configurations
+.vscode/
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
