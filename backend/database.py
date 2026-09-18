@@ -17,7 +17,8 @@ COLLECTIONS = [
     "profiles",
     "achievements",
     "roadmaps",
-    "notifications"
+    "notifications",
+    "market_cache"
 ]
 
 class JSONCollection:
@@ -80,15 +81,17 @@ class JSONCollection:
         self._save(records)
         return doc
 
-    def update_one(self, query, update_dict):
+    def update_one(self, query, update_dict, upsert=False):
         records = self._load()
         doc = self.find_one(query)
+        patch = update_dict.get("$set", update_dict)
         if not doc:
+            if upsert:
+                new_doc = dict(query)
+                new_doc.update(patch)
+                return self.insert_one(new_doc)
             return None
             
-        # Extract $set key if present
-        patch = update_dict.get("$set", update_dict)
-        
         idx = -1
         for i, r in enumerate(records):
             if r.get("_id") == doc.get("_id"):
@@ -166,7 +169,7 @@ class RealMongoCollection:
         doc["id"] = str(doc["_id"])
         return doc
 
-    def update_one(self, query, update_dict):
+    def update_one(self, query, update_dict, upsert=False):
         if "id" in query:
             query["_id"] = query.pop("id")
             
@@ -178,7 +181,7 @@ class RealMongoCollection:
         if "$set" in update_dict:
             update_dict["$set"]["updatedAt"] = datetime.utcnow().isoformat()
             
-        self.coll.update_one(query, update_dict)
+        self.coll.update_one(query, update_dict, upsert=upsert)
         return self.find_one(query)
 
     def delete_one(self, query):

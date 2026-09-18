@@ -73,6 +73,9 @@ def structure_resume(raw_text: str) -> dict:
   "name": string|null,
   "email": string|null,
   "phone": string|null,
+  "target_role": string|null,
+  "experience_level": "Student / Entry"|"Junior"|"Mid-Level"|"Senior"|"Lead",
+  "location": string|null,
   "education": [{"degree": string, "institution": string, "year": string|null}],
   "experience": [{"title": string, "company": string, "duration": string|null, "highlights": [string]}],
   "projects": [{"name": string, "description": string}],
@@ -88,7 +91,7 @@ def structure_resume(raw_text: str) -> dict:
     # Slice raw text to prevent token blowing
     truncated_text = raw_text[:12000]
     
-    user_prompt = f"Extract fields matching this JSON schema exactly:\n{schema}\n\nResume text:\n\"\"\"\n{truncated_text}\n\"\"\""
+    user_prompt = f"Extract fields matching this JSON schema exactly. Infer target_role and experience_level from the background if not explicitly stated:\n{schema}\n\nResume text:\n\"\"\"\n{truncated_text}\n\"\"\""
     
     res = complete_json(system_prompt, [{"role": "user", "content": user_prompt}])
     data = res["data"]
@@ -111,10 +114,20 @@ def structure_resume(raw_text: str) -> dict:
         # Clean duplicates
         found_skills = list(set(found_skills))
         
+        # Deduce a suggested role
+        inferred_role = "Data Scientist"
+        if any(s.lower() in ["react", "html", "css", "figma"] for s in found_skills):
+            inferred_role = "Frontend Developer"
+        elif any(s.lower() in ["machine learning", "pytorch", "tensorflow"] for s in found_skills):
+            inferred_role = "Machine Learning Engineer"
+
         return {
-            "name": quick["possibleName"] or "Guest Explorer",
+            "name": quick["possibleName"] or "Candidate",
             "email": quick["email"],
             "phone": quick["phone"],
+            "target_role": inferred_role,
+            "experience_level": "Student / Entry",
+            "location": "Remote",
             "education": [],
             "experience": [],
             "projects": [],
@@ -129,9 +142,12 @@ def structure_resume(raw_text: str) -> dict:
         }
         
     return {
-        "name": data.get("name") or quick["possibleName"] or "Guest Explorer",
+        "name": data.get("name") or quick["possibleName"] or "Candidate",
         "email": data.get("email") or quick["email"],
         "phone": data.get("phone") or quick["phone"],
+        "target_role": data.get("target_role") or (data.get("experience", [{}])[0].get("title") if data.get("experience") else "Data Scientist"),
+        "experience_level": data.get("experience_level") or ("Junior" if len(data.get("experience", [])) > 0 else "Student / Entry"),
+        "location": data.get("location") or "Remote",
         "education": data.get("education") or [],
         "experience": data.get("experience") or [],
         "projects": data.get("projects") or [],

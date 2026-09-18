@@ -6,13 +6,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Load environment variables
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Primary provider is Gemini if key exists, otherwise OpenAI or mock
-if GEMINI_API_KEY:
-    PROVIDER = "gemini"
+# Primary provider priority: Groq -> Gemini -> OpenAI -> Mock
+if GROQ_API_KEY:
+    PROVIDER = f"groq ({GROQ_MODEL})"
+elif GEMINI_API_KEY:
+    PROVIDER = f"gemini ({GEMINI_MODEL})"
 elif OPENAI_API_KEY:
     PROVIDER = "openai"
 else:
@@ -20,15 +24,58 @@ else:
 
 def complete(system: str, messages: list, max_tokens: int = 800, temperature: float = 0.4, json_mode: bool = False):
     """
-    Calls the configured LLM API (Gemini or OpenAI) or returns a mock response if no keys exist.
-    messages: list of dicts like [{"role": "user"|"assistant", "content": "text"}]
+    Calls the configured LLM API (Groq -> Gemini -> OpenAI) or returns a mock response if no keys exist.
+    messages: list of dicts like [{"role": "user"|"assistant"|"bot", "content": "text"}]
     """
-    if PROVIDER == "gemini":
+    if GROQ_API_KEY:
+        return complete_groq(system, messages, max_tokens, temperature, json_mode)
+    elif GEMINI_API_KEY:
         return complete_gemini(system, messages, max_tokens, temperature, json_mode)
-    elif PROVIDER == "openai":
+    elif OPENAI_API_KEY:
         return complete_openai(system, messages, max_tokens, temperature, json_mode)
     else:
-        return stub_response("Mock AI Response. Configure GEMINI_API_KEY or OPENAI_API_KEY in the environment to connect to a real model.", system, messages, json_mode)
+        return stub_response("Mock AI Response. Configure GROQ_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY in the environment to connect to a real model.", system, messages, json_mode)
+
+def complete_groq(system: str, messages: list, max_tokens: int, temperature: float, json_mode: bool):
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_API_KEY}"
+        }
+        
+        groq_messages = [{"role": "system", "content": system}]
+        for m in messages:
+            role = "user" if m.get("role") == "user" else "assistant"
+            groq_messages.append({"role": role, "content": m.get("content", "")})
+            
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": groq_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature
+        }
+        
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+            
+        response = requests.post(url, json=payload, headers=headers, timeout=25)
+        response.raise_for_status()
+        data = response.json()
+        
+        text = data["choices"][0]["message"]["content"]
+        return {"text": text, "stub": False, "raw": data, "provider": "groq"}
+        
+    except Exception as e:
+        print(f"[LLM Service - Groq Error] {e}")
+        # Fallback to Gemini if configured
+        if GEMINI_API_KEY:
+            print("[LLM Service] Falling back from Groq to Gemini...")
+            return complete_gemini(system, messages, max_tokens, temperature, json_mode)
+        elif OPENAI_API_KEY:
+            print("[LLM Service] Falling back from Groq to OpenAI...")
+            return complete_openai(system, messages, max_tokens, temperature, json_mode)
+        return stub_response(f"Groq API Error. Ensure your GROQ_API_KEY is valid. Message: {str(e)}", system, messages, json_mode)
 
 def complete_gemini(system: str, messages: list, max_tokens: int, temperature: float, json_mode: bool):
     try:

@@ -2,17 +2,19 @@ import os
 import shutil
 import uuid
 import json
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from passlib.context import CryptContext
+import bcrypt
 from jose import jwt, JWTError
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 
 # Import Database & Services
 from database import db
@@ -27,8 +29,30 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 hours
 # Setup FastAPI
 app = FastAPI(title="Kingmaker AI Career API", version="1.0.0")
 
-# Security Hashing Setup
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Security Hashing & Rate Limiting Setup
+def hash_password(password: str) -> str:
+    pwd_bytes = password.encode("utf-8")[:72]
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        pwd_bytes = plain_password.encode("utf-8")[:72]
+        hashed_bytes = hashed_password.encode("utf-8")
+        return bcrypt.checkpw(pwd_bytes, hashed_bytes)
+    except Exception:
+        return False
+
+# Precompute dummy hash to mitigate timing attacks on nonexistent accounts
+DUMMY_HASH = hash_password("dummy_constant_time_comparison_string")
+
+FAILED_LOGIN_ATTEMPTS = defaultdict(list)
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_WINDOW_SECONDS = 300 # 5 minutes
+
+SIGNUP_ATTEMPTS = defaultdict(list)
+MAX_SIGNUPS_PER_WINDOW = 10
+SIGNUP_WINDOW_SECONDS = 300
 
 # CORS setup
 app.add_middleware(
@@ -46,12 +70,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 trainer.get_or_create_dataset()
 
 # JWT Helpers
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -75,7 +93,7 @@ async def get_current_user(
     Middleware decoding either Bearer JWT token or x-guest-id header.
     Maps to req.user in the Node.js implementation.
     """
-    if authorization and authorization.startswith("Bearer "):
+    if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
         token = authorization.split(" ")[1]
         try:
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -83,37 +101,78 @@ async def get_current_user(
             if user_id is None:
                 raise HTTPException(status_code=401, detail="Invalid token subject.")
             
-            # Fetch user from DB
-            user = db.users.find_one({"_id": user_id})
+            # Fetch user from DB (support both _id and id query)
+            user = db.users.find_one({"_id": user_id}) or db.users.find_one({"id": user_id})
             if not user:
                 raise HTTPException(status_code=401, detail="User not found.")
                 
-            return AuthUser(user_id=user["id"], is_guest=False, email=user.get("email"), name=user.get("name"))
+            actual_id = str(user.get("id") or user.get("_id"))
+            return AuthUser(user_id=actual_id, is_guest=False, email=user.get("email"), name=user.get("name"))
         except JWTError:
             raise HTTPException(status_code=401, detail="Token verification failed.")
             
-    elif x_guest_id:
-        # User is in guest mode
-        return AuthUser(user_id=x_guest_id, is_guest=True, name="Guest Explorer")
+    elif x_guest_id and isinstance(x_guest_id, str):
+        clean_guest_id = str(x_guest_id).strip()
+        # Security: ensure guest IDs strictly follow guest format and cannot spoof real user IDs
+        if not clean_guest_id.startswith("guest-") or len(clean_guest_id) < 10:
+            raise HTTPException(status_code=401, detail="Invalid guest identifier format.")
+        if db.users.find_one({"_id": clean_guest_id}) or db.users.find_one({"id": clean_guest_id}):
+            raise HTTPException(status_code=401, detail="Invalid guest credentials.")
+        return AuthUser(user_id=clean_guest_id, is_guest=True, name="Guest Explorer")
         
     raise HTTPException(
         status_code=401,
         detail="Authentication credentials missing. Supply Bearer JWT or x-guest-id header."
     )
 
-# Pydantic schemas
+# Pydantic schemas with security validations
 class SignupModel(BaseModel):
     email: EmailStr
     password: str
     name: str
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        clean = v.strip()
+        if len(clean) < 2:
+            raise ValueError("Name must be at least 2 characters long.")
+        if len(clean) > 60:
+            raise ValueError("Name cannot exceed 60 characters.")
+        return clean
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long.")
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("Password cannot exceed 72 bytes.")
+        has_letter = any(c.isalpha() for c in v)
+        has_digit_or_special = any(not c.isalpha() for c in v)
+        if not (has_letter and has_digit_or_special):
+            raise ValueError("Password must contain at least one letter and at least one number or special symbol.")
+        return v
+
 class LoginModel(BaseModel):
     email: EmailStr
     password: str
 
+    @field_validator("password")
+    @classmethod
+    def validate_login_password(cls, v: str) -> str:
+        if not v:
+            raise ValueError("Password is required.")
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("Password exceeds maximum allowed length.")
+        return v
+
 class ChatMessageModel(BaseModel):
     message: str
     conversationId: Optional[str] = None
+
+class NewConversationModel(BaseModel):
+    title: Optional[str] = "New Conversation"
 
 class ProfileUpdateModel(BaseModel):
     targetRole: Optional[str] = None
@@ -139,6 +198,12 @@ class SettingsUpdateModel(BaseModel):
     theme: Optional[str] = None
     notificationsEnabled: Optional[bool] = None
     language: Optional[str] = None
+
+class OnboardingCompleteModel(BaseModel):
+    targetRole: str
+    experienceLevel: str
+    region: str
+    expectedSalary: str
 
 class TrainClassifierModel(BaseModel):
     modelName: str
@@ -168,8 +233,23 @@ def health():
 # AUTH SYSTEM
 # ==========================================
 @app.post("/api/auth/signup")
-def signup(data: SignupModel):
-    existing = db.users.find_one({"email": data.email.lower()})
+def signup(data: SignupModel, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+
+    # Rate limiting for signup
+    recent_signups = [t for t in SIGNUP_ATTEMPTS[client_ip] if now - t < SIGNUP_WINDOW_SECONDS]
+    SIGNUP_ATTEMPTS[client_ip] = recent_signups
+    if len(recent_signups) >= MAX_SIGNUPS_PER_WINDOW:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many signup attempts from this network. Please try again in 5 minutes."
+        )
+
+    clean_email = data.email.strip().lower()
+    clean_name = data.name.strip()
+
+    existing = db.users.find_one({"email": clean_email})
     if existing:
         raise HTTPException(status_code=400, detail="An account with this email already exists.")
         
@@ -177,19 +257,22 @@ def signup(data: SignupModel):
     user_id = str(uuid.uuid4())
     user_doc = {
         "_id": user_id,
-        "email": data.email.lower(),
+        "id": user_id,
+        "email": clean_email,
         "password": hashed,
-        "name": data.name
+        "name": clean_name,
+        "onboarded": False
     }
     
     # Save user
     db.users.insert_one(user_doc)
+    SIGNUP_ATTEMPTS[client_ip].append(now)
     
     # Create profile document
     profile_doc = {
         "_id": str(uuid.uuid4()),
         "userId": user_id,
-        "name": data.name,
+        "name": clean_name,
         "targetRole": "",
         "experienceLevel": "Student / Entry",
         "region": "",
@@ -198,26 +281,201 @@ def signup(data: SignupModel):
         "careerScore": 0,
         "readinessScore": 0,
         "strengths": [],
-        "weaknesses": []
+        "weaknesses": [],
+        "onboarded": False
     }
     db.profiles.insert_one(profile_doc)
     
-    token = create_access_token({"sub": user_id})
+    token = create_access_token({"sub": user_id, "email": clean_email})
     return {
         "token": token,
-        "user": {"email": data.email.lower(), "name": data.name, "id": user_id}
+        "user": {"email": clean_email, "name": clean_name, "id": user_id, "onboarded": False}
     }
 
 @app.post("/api/auth/login")
-def login(data: LoginModel):
-    user = db.users.find_one({"email": data.email.lower()})
-    if not user or not verify_password(data.password, user["password"]):
+def login(data: LoginModel, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    clean_email = data.email.strip().lower()
+    now = time.time()
+
+    # Check brute force lockout on IP or email
+    ip_attempts = [t for t in FAILED_LOGIN_ATTEMPTS[client_ip] if now - t < LOCKOUT_WINDOW_SECONDS]
+    FAILED_LOGIN_ATTEMPTS[client_ip] = ip_attempts
+    email_attempts = [t for t in FAILED_LOGIN_ATTEMPTS[clean_email] if now - t < LOCKOUT_WINDOW_SECONDS]
+    FAILED_LOGIN_ATTEMPTS[clean_email] = email_attempts
+
+    if len(ip_attempts) >= MAX_FAILED_ATTEMPTS or len(email_attempts) >= MAX_FAILED_ATTEMPTS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Account temporarily locked for 5 minutes for security."
+        )
+
+    user = db.users.find_one({"email": clean_email})
+
+    # Constant-time verification to mitigate timing attacks
+    password_valid = False
+    if user and "password" in user:
+        password_valid = verify_password(data.password, user["password"])
+    else:
+        # Dummy verification to equalize timing
+        verify_password(data.password, DUMMY_HASH)
+
+    if not user or not password_valid:
+        FAILED_LOGIN_ATTEMPTS[client_ip].append(now)
+        FAILED_LOGIN_ATTEMPTS[clean_email].append(now)
         raise HTTPException(status_code=400, detail="Invalid email or password.")
-        
-    token = create_access_token({"sub": user["id"]})
+
+    # Successful login: reset failed attempts
+    FAILED_LOGIN_ATTEMPTS[client_ip] = []
+    FAILED_LOGIN_ATTEMPTS[clean_email] = []
+
+    user_id = str(user.get("id") or user.get("_id"))
+    token = create_access_token({"sub": user_id, "email": clean_email})
+
+    # Check onboarded status
+    user_onboarded = user.get("onboarded")
+    if user_onboarded is None:
+        prof = db.profiles.find_one({"userId": user_id})
+        user_onboarded = bool(prof and prof.get("targetRole") and prof.get("skillsList"))
+
     return {
         "token": token,
-        "user": {"email": user["email"], "name": user["name"], "id": user["id"]}
+        "user": {
+            "email": clean_email,
+            "name": user.get("name", "User"),
+            "id": user_id,
+            "onboarded": bool(user_onboarded)
+        }
+    }
+
+# ==========================================
+# ONBOARDING SYSTEM (MANDATORY GATE)
+# ==========================================
+@app.post("/api/onboarding/resume")
+def onboarding_upload_resume(file: UploadFile = File(...), user: AuthUser = Depends(get_current_user)):
+    file_id = str(uuid.uuid4())
+    _, ext = os.path.splitext(file.filename.lower())
+    
+    if ext not in [".pdf", ".docx"]:
+        raise HTTPException(status_code=400, detail="Please upload a valid PDF or DOCX resume document.")
+        
+    saved_path = os.path.join(UPLOAD_DIR, f"{file_id}{ext}")
+    with open(saved_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    size_bytes = os.path.getsize(saved_path)
+    
+    file_doc = {
+        "_id": file_id,
+        "id": file_id,
+        "userId": user.id,
+        "originalName": file.filename,
+        "path": saved_path,
+        "size": size_bytes,
+        "category": "resume",
+        "status": "processed",
+        "createdAt": datetime.utcnow().isoformat()
+    }
+    db.files.insert_one(file_doc)
+    
+    # Extract text and parse with AI
+    text = resume_parser.extract_text(saved_path, file.filename)
+    parsed = resume_parser.structure_resume(text) if text else {
+        "name": user.name or "Candidate",
+        "target_role": "Data Scientist",
+        "experience_level": "Student / Entry",
+        "location": "Remote",
+        "skills": ["Python", "SQL", "Problem Solving"]
+    }
+    
+    extracted_skills = parsed.get("skills", [])
+    suggested_role = parsed.get("target_role") or "Data Scientist"
+    suggested_level = parsed.get("experience_level") or "Student / Entry"
+    suggested_region = parsed.get("location") or "Remote"
+    suggested_salary = "$80,000 - $120,000"
+    
+    db.profiles.update_one(
+        {"userId": user.id},
+        {
+            "$set": {
+                "skillsList": extracted_skills,
+                "resumeFileId": file_id,
+                "resumeFileName": file.filename
+            }
+        }
+    )
+    
+    return {
+        "fileId": file_id,
+        "fileName": file.filename,
+        "extracted": {
+            "name": parsed.get("name") or user.name,
+            "targetRole": suggested_role,
+            "experienceLevel": suggested_level,
+            "region": suggested_region,
+            "expectedSalary": suggested_salary,
+            "skills": extracted_skills
+        }
+    }
+
+@app.post("/api/onboarding/complete")
+def onboarding_complete(data: OnboardingCompleteModel, user: AuthUser = Depends(get_current_user)):
+    target_role = data.targetRole.strip()
+    experience_level = data.experienceLevel.strip()
+    region = data.region.strip()
+    expected_salary = data.expectedSalary.strip()
+    
+    if not target_role or not experience_level or not region or not expected_salary:
+        raise HTTPException(
+            status_code=400,
+            detail="All 4 career parameters (Target Role, Experience Level, Preferred Region, Expected Salary Band) are compulsory."
+        )
+        
+    # Verify that user has uploaded at least one resume file
+    has_resume = db.files.find_one({"userId": user.id, "category": "resume"})
+    if not has_resume:
+        raise HTTPException(
+            status_code=400,
+            detail="A compulsory resume upload is required before completing onboarding."
+        )
+        
+    # Update user document
+    db.users.update_one(
+        {"$or": [{"_id": user.id}, {"id": user.id}]},
+        {"$set": {"onboarded": True}}
+    )
+    
+    # Update profile document
+    db.profiles.update_one(
+        {"userId": user.id},
+        {
+            "$set": {
+                "targetRole": target_role,
+                "experienceLevel": experience_level,
+                "region": region,
+                "expectedSalary": expected_salary,
+                "onboarded": True
+            }
+        }
+    )
+    
+    # Generate insights and unlock initial achievements
+    profile_engine.generate_profile_insights(user.id)
+    ach_res = achievements.evaluate(user.id)
+    
+    updated_profile = db.profiles.find_one({"userId": user.id})
+    updated_user = db.users.find_one({"$or": [{"_id": user.id}, {"id": user.id}]}) or {}
+    
+    return {
+        "status": "success",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name or updated_user.get("name", "User"),
+            "onboarded": True
+        },
+        "profile": updated_profile,
+        "unlockedAchievements": ach_res.get("newly", [])
     }
 
 @app.post("/api/auth/guest")
@@ -246,47 +504,136 @@ def guest():
 # ==========================================
 # CHAT SYSTEM
 # ==========================================
+@app.get("/api/chat/conversations")
+def list_conversations(user: AuthUser = Depends(get_current_user)):
+    convs = db.conversations.find({"userId": user.id})
+    convs_sorted = sorted(convs, key=lambda x: x.get("updatedAt", x.get("createdAt", "")), reverse=True)
+    return {
+        "conversations": [
+            {
+                "id": str(c.get("id") or c.get("_id")),
+                "title": c.get("title", "New Conversation"),
+                "createdAt": c.get("createdAt", ""),
+                "updatedAt": c.get("updatedAt", "")
+            }
+            for c in convs_sorted
+        ]
+    }
+
+@app.post("/api/chat/new")
+def new_conversation(data: Optional[NewConversationModel] = None, user: AuthUser = Depends(get_current_user)):
+    conv_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    raw_title = (data.title if data and data.title else "New Conversation").strip()
+    title = raw_title[:40] if raw_title else "New Conversation"
+    conv_doc = {
+        "_id": conv_id,
+        "id": conv_id,
+        "userId": user.id,
+        "title": title,
+        "createdAt": now,
+        "updatedAt": now
+    }
+    db.conversations.insert_one(conv_doc)
+    return {
+        "conversation": {
+            "id": conv_id,
+            "title": title,
+            "createdAt": now,
+            "updatedAt": now
+        }
+    }
+
+@app.delete("/api/chat/conversations/{conv_id}")
+def delete_conversation(conv_id: str, user: AuthUser = Depends(get_current_user)):
+    db.conversations.delete_one({"userId": user.id, "id": conv_id})
+    db.conversations.delete_one({"userId": user.id, "_id": conv_id})
+    db.messages.delete_many({"userId": user.id, "conversationId": conv_id})
+    return {"status": "ok", "deletedId": conv_id}
+
 @app.get("/api/chat/history")
-def chat_history(user: AuthUser = Depends(get_current_user)):
-    msgs = db.messages.find({"userId": user.id})
-    # Sort messages
+def chat_history(conversationId: Optional[str] = Query(None), user: AuthUser = Depends(get_current_user)):
+    target_conv_id = conversationId
+    if not target_conv_id:
+        convs = db.conversations.find({"userId": user.id})
+        convs_sorted = sorted(convs, key=lambda x: x.get("updatedAt", x.get("createdAt", "")), reverse=True)
+        if convs_sorted:
+            target_conv_id = str(convs_sorted[0].get("id") or convs_sorted[0].get("_id"))
+
+    if not target_conv_id:
+        return {"conversationId": None, "messages": []}
+
+    msgs = db.messages.find({"userId": user.id, "conversationId": target_conv_id})
     msgs_sorted = sorted(msgs, key=lambda x: x.get("createdAt", ""))
-    return {"messages": [{"role": m["role"], "text": m["content"]} for m in msgs_sorted]}
+    return {
+        "conversationId": target_conv_id,
+        "messages": [{"role": m["role"], "text": m["content"]} for m in msgs_sorted]
+    }
 
 @app.post("/api/chat")
 def chat(data: ChatMessageModel, user: AuthUser = Depends(get_current_user)):
-    conv_id = data.conversationId or str(uuid.uuid4())
-    
-    # Save user message
+    now = datetime.utcnow().isoformat()
+    clean_msg = data.message.strip()
+
+    # 1. Retrieve or automatically create the conversation thread
+    conv_id = data.conversationId
+    conversation = None
+    if conv_id:
+        conversation = db.conversations.find_one({"userId": user.id, "_id": conv_id}) or db.conversations.find_one({"userId": user.id, "id": conv_id})
+
+    if not conversation:
+        conv_id = conv_id or str(uuid.uuid4())
+        # Generate friendly title from first prompt (max 36 chars)
+        derived_title = clean_msg.replace("\n", " ")[:36].strip()
+        title = derived_title + ("..." if len(clean_msg) > 36 else "") if derived_title else "Career Guidance"
+        conv_doc = {
+            "_id": conv_id,
+            "id": conv_id,
+            "userId": user.id,
+            "title": title,
+            "createdAt": now,
+            "updatedAt": now
+        }
+        db.conversations.insert_one(conv_doc)
+    else:
+        conv_id = str(conversation.get("id") or conversation.get("_id"))
+        db.conversations.update_one(
+            {"_id": conv_id},
+            {"$set": {"updatedAt": now}}
+        )
+
+    # 2. Save user message to persistent DB
     user_msg_doc = {
         "_id": str(uuid.uuid4()),
         "userId": user.id,
         "conversationId": conv_id,
         "role": "user",
-        "content": data.message
+        "content": clean_msg,
+        "createdAt": now
     }
     db.messages.insert_one(user_msg_doc)
-    
-    # Fetch recent conversation context (last 10 messages)
-    history_docs = db.messages.find({"userId": user.id, "conversationId": conv_id})
-    history_docs = sorted(history_docs, key=lambda x: x.get("createdAt", ""))[-10:]
-    
-    history = [{"role": m["role"], "content": m["content"]} for m in history_docs]
-    
-    # Fetch user's profile and files for context
+
+    # 3. Sliding Window Memory Optimization:
+    # We store all messages in MongoDB for full UI history, but only provide the last 8 messages
+    # to Groq/LLM to prevent token bloat, latency spikes, and quota exhaustion!
+    all_history = db.messages.find({"userId": user.id, "conversationId": conv_id})
+    sorted_history = sorted(all_history, key=lambda x: x.get("createdAt", ""))
+    recent_context = sorted_history[-8:]
+    history = [{"role": m["role"], "content": m["content"]} for m in recent_context]
+
+    # 4. Profile & Resume Context Injection
     profile = db.profiles.find_one({"userId": user.id}) or {}
     resume_files = list(db.files.find({"userId": user.id, "category": "resume"}))
-    
+
     resume_context = ""
     if resume_files:
         try:
-            # Sort by creation date or use the last one
             latest_resume = sorted(resume_files, key=lambda x: x.get("createdAt", ""))[-1]
             raw_text = resume_parser.extract_text(latest_resume["path"], latest_resume["originalName"])
-            resume_context = raw_text[:5000] # Cap to prevent inflating token usage
+            resume_context = raw_text[:4000]
         except Exception as e:
             print(f"Error reading resume for chat context: {e}")
-            
+
     profile_context = (
         f"Target Career: {profile.get('targetRole') or 'Not specified'}\n"
         f"Experience Level: {profile.get('experienceLevel') or 'Not specified'}\n"
@@ -294,13 +641,13 @@ def chat(data: ChatMessageModel, user: AuthUser = Depends(get_current_user)):
         f"Strengths: {', '.join(profile.get('strengths', [])) if profile.get('strengths') else 'None'}\n"
         f"Areas to improve: {', '.join(profile.get('weaknesses', [])) if profile.get('weaknesses') else 'None'}\n"
     )
-    
+
     system_prompt = (
         "You are the Kingmaker Career Guidance Bot, a premium AI career advisor.\n"
         "Here is the context about the user's profile:\n"
         f"{profile_context}\n"
     )
-    
+
     if resume_context:
         system_prompt += (
             f"Here is the raw text extracted from the user's uploaded resume:\n"
@@ -313,30 +660,30 @@ def chat(data: ChatMessageModel, user: AuthUser = Depends(get_current_user)):
             "The user has not uploaded a resume yet. If they ask about their resume, politely explain that "
             "you can't see it yet, and ask them to upload it in the 'Upload Files' section so you can analyze it.\n"
         )
-        
+
     system_prompt += (
         "\nProvide constructive, practical, and highly engaging advice about career paths, skills, "
         "and closing knowledge gaps. Use concise paragraphs or clear bullet points. "
         "Keep responses under 150 words unless detail is requested."
     )
-    
+
+    # 5. Call LLM (Groq -> Gemini -> OpenAI -> Mock)
     res = llm_service.complete(system_prompt, history)
     bot_reply = res["text"]
-    
-    # Save bot message
+
+    # 6. Save bot message to DB
     bot_msg_doc = {
         "_id": str(uuid.uuid4()),
         "userId": user.id,
         "conversationId": conv_id,
         "role": "bot",
-        "content": bot_reply
+        "content": bot_reply,
+        "createdAt": datetime.utcnow().isoformat()
     }
     db.messages.insert_one(bot_msg_doc)
-    
-    # Evaluate Achievements
+
+    # 7. Evaluate Achievements
     ach_res = achievements.evaluate(user.id)
-    
-    # Create notification triggers for newly unlocked achievements
     for a in ach_res["newly"]:
         db.notifications.insert_one({
             "_id": str(uuid.uuid4()),
@@ -347,7 +694,7 @@ def chat(data: ChatMessageModel, user: AuthUser = Depends(get_current_user)):
             "read": False,
             "silent": False
         })
-        
+
     return {
         "conversationId": conv_id,
         "reply": bot_reply,

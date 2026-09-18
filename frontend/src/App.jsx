@@ -2,6 +2,11 @@ import React, { useState, useEffect, useRef } from "react";
 
 const API_BASE = "http://localhost:8000";
 
+const DEFAULT_WELCOME_MSG = {
+  role: "bot",
+  text: "Hi, I'm the Kingmaker guidance bot. Tell me about your background, or ask a question — e.g. \"What skills do I need for data science?\""
+};
+
 export default function App() {
   // ---- Auth States ----
   const [token, setToken] = useState(localStorage.getItem("kmk_token") || "");
@@ -13,16 +18,28 @@ export default function App() {
   const [authPassword, setAuthPassword] = useState("");
   const [authError, setAuthError] = useState("");
 
+  // ---- Mandatory Onboarding States ----
+  const [onboardingStep, setOnboardingStep] = useState(1); // 1: Resume Upload, 2: Career Parameters
+  const [onboardingResumeFile, setOnboardingResumeFile] = useState(null);
+  const [onboardingUploading, setOnboardingUploading] = useState(false);
+  const [onboardingError, setOnboardingError] = useState("");
+  const [extractedData, setExtractedData] = useState(null);
+  const [targetRole, setTargetRole] = useState("");
+  const [experienceLevel, setExperienceLevel] = useState("Student / Entry");
+  const [preferredRegion, setPreferredRegion] = useState("");
+  const [expectedSalary, setExpectedSalary] = useState("");
+  const [submittingOnboarding, setSubmittingOnboarding] = useState(false);
+
   // ---- Navigation ----
   const [view, setView] = useState("chat");
 
   // ---- Core Feature States ----
-  const [chatMessages, setChatMessages] = useState([
-    { role: "bot", text: "Hi, I'm the Kingmaker guidance bot. Tell me about your background, or ask a question — e.g. \"What skills do I need for data science?\"" }
-  ]);
+  const [chatMessages, setChatMessages] = useState([DEFAULT_WELCOME_MSG]);
   const [chatInput, setChatInput] = useState("");
   const [chatConversationId, setChatConversationId] = useState(null);
   const [chatThinking, setChatThinking] = useState(false);
+  const [conversations, setConversations] = useState([]);
+  const [loadingConversations, setLoadingConversations] = useState(false);
 
   const [files, setFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
@@ -92,22 +109,51 @@ export default function App() {
       headers["Content-Type"] = "application/json";
     }
 
-    const res = await fetch(`${API_BASE}${path}`, {
-      method: options.method || "GET",
-      headers,
-      body: options.isForm ? options.body : options.body ? JSON.stringify(options.body) : undefined,
-    });
+    try {
+      const res = await fetch(`${API_BASE}${path}`, {
+        method: options.method || "GET",
+        headers,
+        body: options.isForm ? options.body : options.body ? JSON.stringify(options.body) : undefined,
+      });
 
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data.detail || `Request failed (${res.status})`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        let errMsg = `Request failed (${res.status})`;
+        if (typeof data.detail === "string") {
+          errMsg = data.detail;
+        } else if (Array.isArray(data.detail)) {
+          errMsg = data.detail
+            .map((d) => (d.msg ? d.msg.replace(/^Value error,\s*/i, "") : JSON.stringify(d)))
+            .join(", ");
+        } else if (data.message) {
+          errMsg = data.message;
+        }
+        throw new Error(errMsg);
+      }
+      return data;
+    } catch (err) {
+      if (err.message === "Failed to fetch") {
+        throw new Error(
+          `Unable to connect to the Kingmaker backend (${API_BASE}). Please ensure the server is running.`
+        );
+      }
+      throw err;
     }
-    return data;
   };
 
   // ---- Effects ----
   useEffect(() => {
     if (token || guestId) {
+      if (user && user.onboarded === false) {
+        return;
+      }
+      fetchConversations().then((convs) => {
+        if (convs && convs.length > 0) {
+          fetchChatHistory(convs[0].id);
+        } else {
+          fetchChatHistory();
+        }
+      });
       fetchDashboard();
       fetchProfile();
       fetchFiles();
@@ -115,7 +161,7 @@ export default function App() {
       fetchAchievements();
       fetchSettings();
     }
-  }, [token, guestId]);
+  }, [token, guestId, user?.onboarded]);
 
   useEffect(() => {
     if (view === "market") {
@@ -132,6 +178,62 @@ export default function App() {
   }, [chatMessages, chatThinking]);
 
   // ---- Fetch Functions ----
+  const fetchConversations = async () => {
+    setLoadingConversations(true);
+    try {
+      const data = await api("/api/chat/conversations");
+      const list = data.conversations || [];
+      setConversations(list);
+      return list;
+    } catch (e) {
+      console.error("Failed to load conversations", e);
+      return [];
+    } finally {
+      setLoadingConversations(false);
+    }
+  };
+
+  const fetchChatHistory = async (convId = null) => {
+    try {
+      const query = convId ? `?conversationId=${encodeURIComponent(convId)}` : "";
+      const data = await api(`/api/chat/history${query}`);
+      if (data.messages && data.messages.length > 0) {
+        setChatMessages(data.messages);
+      } else {
+        setChatMessages([DEFAULT_WELCOME_MSG]);
+      }
+      setChatConversationId(data.conversationId);
+      return data;
+    } catch (e) {
+      console.error("Failed to load chat history", e);
+      setChatMessages([DEFAULT_WELCOME_MSG]);
+    }
+  };
+
+  const handleSelectConversation = async (convId) => {
+    if (convId === chatConversationId) return;
+    setChatConversationId(convId);
+    await fetchChatHistory(convId);
+  };
+
+  const handleNewChat = () => {
+    setChatConversationId(null);
+    setChatMessages([DEFAULT_WELCOME_MSG]);
+  };
+
+  const handleDeleteConversation = async (e, convId) => {
+    e.stopPropagation();
+    try {
+      await api(`/api/chat/conversations/${encodeURIComponent(convId)}`, { method: "DELETE" });
+      setConversations((prev) => prev.filter((c) => c.id !== convId));
+      if (chatConversationId === convId) {
+        handleNewChat();
+      }
+    } catch (err) {
+      console.error("Failed to delete conversation", err);
+    }
+  };
+
   const fetchDashboard = async () => {
     setLoadingDashboard(true);
     try {
@@ -233,10 +335,36 @@ export default function App() {
   const handleAuthSubmit = async (e) => {
     e.preventDefault();
     setAuthError("");
+
+    const cleanEmail = (authEmail || "").trim().toLowerCase();
+    const cleanPassword = authPassword || "";
+
+    if (authMode === "signup") {
+      const cleanName = (authName || "").trim();
+      if (!cleanName || cleanName.length < 2) {
+        setAuthError("Name must be at least 2 characters long.");
+        return;
+      }
+      if (cleanPassword.length < 8) {
+        setAuthError("Password must be at least 8 characters long.");
+        return;
+      }
+      if (cleanPassword.length > 72) {
+        setAuthError("Password cannot exceed 72 characters.");
+        return;
+      }
+      const hasLetter = /[a-zA-Z]/.test(cleanPassword);
+      const hasNumberOrSymbol = /[^a-zA-Z]/.test(cleanPassword);
+      if (!hasLetter || !hasNumberOrSymbol) {
+        setAuthError("Password must include at least one letter and one number or symbol.");
+        return;
+      }
+    }
+
     const path = authMode === "signup" ? "/api/auth/signup" : "/api/auth/login";
     const body = authMode === "signup"
-      ? { email: authEmail, password: authPassword, name: authName }
-      : { email: authEmail, password: authPassword };
+      ? { email: cleanEmail, password: cleanPassword, name: (authName || "").trim() }
+      : { email: cleanEmail, password: cleanPassword };
 
     try {
       const data = await api(path, { method: "POST", body });
@@ -244,7 +372,17 @@ export default function App() {
       localStorage.setItem("kmk_user", JSON.stringify(data.user));
       setToken(data.token);
       setUser(data.user);
-      setView("chat");
+      if (data.user.onboarded === false) {
+        setOnboardingStep(1);
+        setOnboardingResumeFile(null);
+        setExtractedData(null);
+        setTargetRole("");
+        setExperienceLevel("Student / Entry");
+        setPreferredRegion("");
+        setExpectedSalary("");
+      } else {
+        setView("chat");
+      }
     } catch (err) {
       setAuthError(err.message);
     }
@@ -272,6 +410,78 @@ export default function App() {
     setUser(null);
   };
 
+  // ---- Onboarding Action Handlers ----
+  const handleOnboardingResumeUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setOnboardingError("");
+    setOnboardingUploading(true);
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await api("/api/onboarding/resume", {
+        method: "POST",
+        body: formData,
+        isForm: true,
+      });
+
+      setOnboardingResumeFile(file);
+      setExtractedData(res.extracted);
+
+      if (res.extracted.targetRole) setTargetRole(res.extracted.targetRole);
+      if (res.extracted.experienceLevel) setExperienceLevel(res.extracted.experienceLevel);
+      if (res.extracted.region) setPreferredRegion(res.extracted.region);
+      else if (!preferredRegion) setPreferredRegion("Remote");
+      if (res.extracted.expectedSalary) setExpectedSalary(res.extracted.expectedSalary);
+
+      setOnboardingStep(2);
+    } catch (err) {
+      setOnboardingError(err.message || "Failed to parse resume. Please upload a valid PDF or DOCX file.");
+    } finally {
+      setOnboardingUploading(false);
+    }
+  };
+
+  const handleCompleteOnboarding = async (e) => {
+    e.preventDefault();
+    if (!targetRole.trim() || !experienceLevel.trim() || !preferredRegion.trim() || !expectedSalary.trim()) {
+      setOnboardingError("All 4 career parameters are compulsory before entering Kingmaker.");
+      return;
+    }
+    setOnboardingError("");
+    setSubmittingOnboarding(true);
+
+    try {
+      const res = await api("/api/onboarding/complete", {
+        method: "POST",
+        body: {
+          targetRole: targetRole.trim(),
+          experienceLevel: experienceLevel.trim(),
+          region: preferredRegion.trim(),
+          expectedSalary: expectedSalary.trim(),
+        },
+      });
+
+      const updatedUser = { ...user, onboarded: true };
+      localStorage.setItem("kmk_user", JSON.stringify(updatedUser));
+      setUser(updatedUser);
+      setProfile(res.profile);
+      if (res.unlockedAchievements?.length) {
+        showToasts(res.unlockedAchievements);
+        fetchAchievements();
+      }
+      fetchDashboard();
+      fetchFiles();
+      setView("chat");
+    } catch (err) {
+      setOnboardingError(err.message || "Failed to complete onboarding.");
+    } finally {
+      setSubmittingOnboarding(false);
+    }
+  };
+
   // ---- Action Handlers ----
   const handleSendMessage = async (text) => {
     if (!text.trim()) return;
@@ -287,6 +497,7 @@ export default function App() {
       });
       setChatConversationId(data.conversationId);
       setChatMessages((prev) => [...prev, { role: "bot", text: data.reply }]);
+      fetchConversations();
       if (data.unlockedAchievements?.length) {
         showToasts(data.unlockedAchievements);
         fetchAchievements();
@@ -466,44 +677,248 @@ export default function App() {
   // ---- Auth Gate ----
   if (!token && !guestId) {
     return (
-      <div className="kmk-auth-wrap" style={{ margin: "12vh auto" }}>
-        <div className="kmk-auth-brand">
-          <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
-            <path d="M13 3C9 3 8 8 8 11C8 15 10 17 13 17C16 17 18 15 18 11C18 8 17 3 13 3Z" stroke="#e8c368" strokeWidth="1.4" />
-            <path d="M13 3V17" stroke="#e8c368" strokeWidth="1.2" />
-            <path d="M8 20L13 17L18 20" stroke="#2a9d8f" strokeWidth="1.4" strokeLinecap="round" />
-          </svg>
-          <div className="txt">KINGMAKER</div>
-        </div>
+      <div className="kmk-auth-backdrop">
+        <div className="kmk-auth-card">
+          <div className="kmk-auth-brand">
+            <div className="kmk-brand-logo-wrap" style={{ width: 44, height: 44 }}>
+              <svg width="24" height="24" viewBox="0 0 26 26" fill="none">
+                <path d="M13 3C9 3 8 8 8 11C8 15 10 17 13 17C16 17 18 15 18 11C18 8 17 3 13 3Z" stroke="#e8c368" strokeWidth="1.6" />
+                <path d="M13 3V17" stroke="#e8c368" strokeWidth="1.3" />
+                <path d="M8 20L13 17L18 20" stroke="#3ec6b5" strokeWidth="1.6" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div>
+              <div className="kmk-auth-title">KINGMAKER</div>
+              <div className="kmk-auth-subtitle">Career Intelligence Platform</div>
+            </div>
+          </div>
 
-        <div className="kmk-auth-tabs">
-          <div className={`kmk-auth-tab ${authMode === "login" ? "active" : ""}`} onClick={() => setAuthMode("login")}>Log In</div>
-          <div className={`kmk-auth-tab ${authMode === "signup" ? "active" : ""}`} onClick={() => setAuthMode("signup")}>Sign Up</div>
-        </div>
+          <div className="kmk-auth-tabs">
+            <div className={`kmk-auth-tab ${authMode === "login" ? "active" : ""}`} onClick={() => setAuthMode("login")}>Log In</div>
+            <div className={`kmk-auth-tab ${authMode === "signup" ? "active" : ""}`} onClick={() => setAuthMode("signup")}>Sign Up</div>
+          </div>
 
-        <form onSubmit={handleAuthSubmit}>
-          {authMode === "signup" && (
+          <form onSubmit={handleAuthSubmit}>
+            {authMode === "signup" && (
+              <div className="kmk-auth-field">
+                <label>Full Name</label>
+                <input type="text" value={authName} onChange={(e) => setAuthName(e.target.value)} placeholder="Jane Doe" required />
+              </div>
+            )}
             <div className="kmk-auth-field">
-              <label>Name</label>
-              <input type="text" value={authName} onChange={(e) => setAuthName(e.target.value)} placeholder="Jane Doe" required />
+              <label>Work Email</label>
+              <input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@company.com" required />
+            </div>
+            <div className="kmk-auth-field">
+              <label>Password</label>
+              <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="At least 8 characters" required />
+            </div>
+            <button type="submit" className="kmk-auth-submit">
+              {authMode === "signup" ? "Create Free Account" : "Sign In to Workspace"}
+            </button>
+            {authError && <div className="kmk-auth-error">{authError}</div>}
+          </form>
+
+          <div className="kmk-auth-divider">
+            <span>or</span>
+          </div>
+
+          <button className="kmk-auth-guest" onClick={handleGuestLogin}>
+            Continue as Guest Explorer →
+          </button>
+          <div className="kmk-auth-foot">Enterprise Security · Powered by Groq & MongoDB</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- Mandatory Onboarding Gate (Fresh Signup) ----
+  if (token && user && user.onboarded === false) {
+    return (
+      <div className="kmk-onboarding-backdrop">
+        <div className="kmk-onboarding-card">
+          <div className="kmk-onboarding-top">
+            <div>
+              <span className="kmk-onboarding-step-pill">
+                {onboardingStep === 1 ? "Step 1 of 2 · Required" : "Step 2 of 2 · Final Verification"}
+              </span>
+              <h2 className="kmk-onboarding-title">
+                {onboardingStep === 1 ? "Upload Your Resume to Begin" : "Verify Your Career Parameters"}
+              </h2>
+              <p className="kmk-onboarding-sub">
+                {onboardingStep === 1
+                  ? "Kingmaker AI extracts your skills, background, and career trajectory to tailor your workspace."
+                  : "These 4 core metrics calibrate your ML market trends, study roadmaps, and AI career guidance."}
+              </p>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="kmk-logout-btn"
+              style={{ fontSize: "11px", padding: "5px 10px" }}
+              title="Sign out of this session"
+            >
+              Sign out
+            </button>
+          </div>
+
+          {onboardingError && (
+            <div className="kmk-auth-error" style={{ marginBottom: 16 }}>
+              {onboardingError}
             </div>
           )}
-          <div className="kmk-auth-field">
-            <label>Email</label>
-            <input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" required />
-          </div>
-          <div className="kmk-auth-field">
-            <label>Password</label>
-            <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="At least 8 characters" required />
-          </div>
-          <button type="submit" className="kmk-auth-submit">
-            {authMode === "signup" ? "Sign Up" : "Log In"}
-          </button>
-          {authError && <div className="kmk-auth-error">{authError}</div>}
-        </form>
 
-        <button className="kmk-auth-guest" onClick={handleGuestLogin}>Continue as Guest</button>
-        <div className="kmk-auth-foot">Offline Sandbox. React + MongoDB Stack</div>
+          {/* STEP 1: COMPULSORY RESUME UPLOAD */}
+          {onboardingStep === 1 && (
+            <div>
+              <div
+                className={`kmk-drop ${onboardingUploading ? "drag" : ""}`}
+                onClick={() => !onboardingUploading && document.getElementById("onboarding-file-input").click()}
+                style={{ padding: "44px 20px" }}
+              >
+                <input
+                  id="onboarding-file-input"
+                  type="file"
+                  accept=".pdf,.docx"
+                  style={{ display: "none" }}
+                  onChange={handleOnboardingResumeUpload}
+                />
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e8c368" strokeWidth="1.6" style={{ marginBottom: 14 }}>
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+                <h3 style={{ fontSize: "16px", marginBottom: 6 }}>
+                  {onboardingUploading ? "Analyzing Resume with AI..." : "Click or Drag & Drop Resume"}
+                </h3>
+                <p style={{ color: "var(--ink-2)", fontSize: "12.5px" }}>
+                  {onboardingUploading
+                    ? "Extracting skills, roles, and experience using Groq LPU..."
+                    : "Compulsory for account activation. Supports PDF and DOCX (up to 10MB)"}
+                </p>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "11.5px", color: "var(--ink-3)", justifyContent: "center" }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                Your resume data is strictly isolated to your private account for career analysis.
+              </div>
+            </div>
+          )}
+
+          {/* STEP 2: VERIFY & COMPLETE THE 4 MANDATORY PARAMETERS */}
+          {onboardingStep === 2 && (
+            <form onSubmit={handleCompleteOnboarding}>
+              {onboardingResumeFile && (
+                <div className="kmk-uploaded-file-banner">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                  <div className="kmk-uploaded-file-name">
+                    Parsed: {onboardingResumeFile.name}
+                  </div>
+                  <button
+                    type="button"
+                    className="kmk-uploaded-file-change"
+                    onClick={() => setOnboardingStep(1)}
+                  >
+                    Change Resume
+                  </button>
+                </div>
+              )}
+
+              {extractedData?.skills?.length > 0 && (
+                <div className="kmk-extracted-skills">
+                  <div className="kmk-extracted-skills-title">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                    Skills Detected From Resume ({extractedData.skills.length})
+                  </div>
+                  <div className="kmk-skill-pill-wrap">
+                    {extractedData.skills.slice(0, 12).map((s, idx) => (
+                      <span key={idx} className="kmk-skill-pill">{s}</span>
+                    ))}
+                    {extractedData.skills.length > 12 && (
+                      <span className="kmk-skill-pill" style={{ opacity: 0.7 }}>+{extractedData.skills.length - 12} more</span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* 4 Compulsory Cards Matching Screenshot */}
+              <div className="kmk-onboarding-grid">
+                <div className="kmk-param-card">
+                  <div className="kmk-param-label">
+                    <span>Target Role</span>
+                    <span className="req">*</span>
+                  </div>
+                  <input
+                    type="text"
+                    className="kmk-param-input"
+                    value={targetRole}
+                    onChange={(e) => setTargetRole(e.target.value)}
+                    placeholder="e.g. Data Scientist / ML Engineer"
+                    required
+                  />
+                </div>
+
+                <div className="kmk-param-card">
+                  <div className="kmk-param-label">
+                    <span>Experience Level</span>
+                    <span className="req">*</span>
+                  </div>
+                  <select
+                    className="kmk-param-select"
+                    value={experienceLevel}
+                    onChange={(e) => setExperienceLevel(e.target.value)}
+                    required
+                  >
+                    <option value="Student / Entry">Student / Entry</option>
+                    <option value="Junior (1-3 yrs)">Junior (1-3 yrs)</option>
+                    <option value="Mid-Level (3-5 yrs)">Mid-Level (3-5 yrs)</option>
+                    <option value="Senior (5-8 yrs)">Senior (5-8 yrs)</option>
+                    <option value="Lead / Principal">Lead / Principal</option>
+                  </select>
+                </div>
+
+                <div className="kmk-param-card">
+                  <div className="kmk-param-label">
+                    <span>Preferred Region</span>
+                    <span className="req">*</span>
+                  </div>
+                  <input
+                    type="text"
+                    className="kmk-param-input"
+                    value={preferredRegion}
+                    onChange={(e) => setPreferredRegion(e.target.value)}
+                    placeholder="e.g. Remote / North America / India"
+                    required
+                  />
+                </div>
+
+                <div className="kmk-param-card">
+                  <div className="kmk-param-label">
+                    <span>Expected Salary Band</span>
+                    <span className="req">*</span>
+                  </div>
+                  <input
+                    type="text"
+                    className="kmk-param-input"
+                    value={expectedSalary}
+                    onChange={(e) => setExpectedSalary(e.target.value)}
+                    placeholder="e.g. $80k - $120k or ₹15 - 25 LPA"
+                    required
+                  />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                className="kmk-auth-submit"
+                disabled={submittingOnboarding || !targetRole.trim() || !preferredRegion.trim() || !expectedSalary.trim()}
+              >
+                {submittingOnboarding ? "Activating Workspace..." : "Complete Setup & Enter Kingmaker →"}
+              </button>
+            </form>
+          )}
+        </div>
       </div>
     );
   }
@@ -522,13 +937,15 @@ export default function App() {
       {/* SIDEBAR */}
       <div className="kmk-side">
         <div className="kmk-brand">
-          <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
-            <path d="M13 3C9 3 8 8 8 11C8 15 10 17 13 17C16 17 18 15 18 11C18 8 17 3 13 3Z" stroke="#e8c368" strokeWidth="1.4" />
-            <path d="M13 3V17" stroke="#e8c368" strokeWidth="1.2" />
-            <path d="M8 20L13 17L18 20" stroke="#2a9d8f" strokeWidth="1.4" strokeLinecap="round" />
-          </svg>
+          <div className="kmk-brand-logo-wrap">
+            <svg width="20" height="20" viewBox="0 0 26 26" fill="none">
+              <path d="M13 3C9 3 8 8 8 11C8 15 10 17 13 17C16 17 18 15 18 11C18 8 17 3 13 3Z" stroke="#e8c368" strokeWidth="1.6" />
+              <path d="M13 3V17" stroke="#e8c368" strokeWidth="1.4" />
+              <path d="M8 20L13 17L18 20" stroke="#3ec6b5" strokeWidth="1.6" strokeLinecap="round" />
+            </svg>
+          </div>
           <div>
-            <div className="kmk-brand-text">KINGMAKER</div>
+            <div className="kmk-brand-text">KINGMAKER <span className="kmk-brand-badge">PRO</span></div>
             <div className="kmk-brand-sub">Career Intelligence</div>
           </div>
         </div>
@@ -575,93 +992,155 @@ export default function App() {
           </button>
         </div>
 
-        <div className="kmk-side-foot">
-          Level 3 Pipeline<br /><b>ML Sandbox</b> · Active
+        <div className="kmk-side-user-card">
+          <div className="kmk-side-avatar">
+            {user?.name ? user.name.charAt(0).toUpperCase() : (guestId ? "G" : "U")}
+          </div>
+          <div className="kmk-side-user-info">
+            <div className="kmk-side-user-name">{user?.name || (guestId ? "Guest Explorer" : "User Workspace")}</div>
+            <div className="kmk-side-user-status">
+              <span className="dot"></span> Online · Workspace Pro
+            </div>
+          </div>
         </div>
       </div>
 
       {/* MAIN CONTAINER */}
       <div className="kmk-main">
         <div className="kmk-topbar">
-          <div>
-            <h1>
-              {view === "chat" && "Guidance Bot"}
-              {view === "upload" && "Upload Files"}
-              {view === "market" && "Market Snapshot"}
-              {view === "roadmap" && "Personalized Roadmaps"}
-              {view === "profile" && "Career Profile"}
-              {view === "achievements" && "Gamified Achievements"}
-              {view === "dashboard" && "Career Twin Dashboard"}
-              {view === "ml_lab" && "Machine Learning & Dataset Laboratory"}
-            </h1>
-            <p>
-              {view === "chat" && "Ask about career planning, machine learning topics, or job signals"}
-              {view === "upload" && "Upload your resume or certificates to update your profile"}
-              {view === "market" && "Drifting job metrics based on actual market indicators"}
-              {view === "roadmap" && "Construct a weekly study guide for any industry path"}
-              {view === "profile" && "Examine your strengths, scores, and skills coverage"}
-              {view === "achievements" && "Milestones representing your progression"}
-              {view === "dashboard" && "View details relating to career metrics and scores"}
-              {view === "ml_lab" && "Interactive sandbox with 13+ ML models, scaling, and datasets"}
-            </p>
+          <div className="kmk-topbar-left">
+            <div>
+              <div className="kmk-breadcrumbs">
+                <span>Kingmaker</span>
+                <span className="sep">/</span>
+                <span>
+                  {view === "chat" && "Guidance Bot"}
+                  {view === "upload" && "Upload Files"}
+                  {view === "market" && "Market Snapshot"}
+                  {view === "roadmap" && "Personalized Roadmaps"}
+                  {view === "profile" && "Career Profile"}
+                  {view === "achievements" && "Achievements"}
+                  {view === "dashboard" && "Career Dashboard"}
+                  {view === "ml_lab" && "ML Laboratory"}
+                </span>
+              </div>
+              <p>
+                {view === "chat" && "Ask about career planning, machine learning topics, or job signals"}
+                {view === "upload" && "Upload your resume or certificates to update your profile"}
+                {view === "market" && "Drifting job metrics based on actual market indicators"}
+                {view === "roadmap" && "Construct a weekly study guide for any industry path"}
+                {view === "profile" && "Examine your strengths, scores, and skills coverage"}
+                {view === "achievements" && "Milestones representing your progression"}
+                {view === "dashboard" && "View details relating to career metrics and scores"}
+                {view === "ml_lab" && "Interactive sandbox with 13+ ML models, scaling, and datasets"}
+              </p>
+            </div>
           </div>
           <div className="kmk-topbar-user">
-            <div className="kmk-pill">
-              <span className="dot"></span> Local Server Active
+            <div className="kmk-model-indicator">
+              <span className="beacon"></span>
+              <span>Groq LPU · Active</span>
             </div>
-            <button className="kmk-logout" onClick={() => setSettingsModalOpen(true)}>Settings</button>
-            <button className="kmk-logout" onClick={handleLogout}>Log Out</button>
+            <button className="kmk-header-btn" onClick={() => setSettingsModalOpen(true)}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+              Settings
+            </button>
+            <button className="kmk-logout-btn" onClick={handleLogout}>Log Out</button>
           </div>
         </div>
 
         <div className="kmk-view">
           {/* VIEW: CHAT */}
           {view === "chat" && (
-            <div className="kmk-chat-wrap">
-              <div className="kmk-messages">
-                {chatMessages.map((m, i) => (
-                  <div key={i} className={`kmk-msg ${m.role === "bot" ? "bot" : "user"}`}>
-                    <div dangerouslySetInnerHTML={{
-                      __html: m.text
-                        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-                        .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-                        .replace(/\n/g, "<br />")
-                    }} />
-                  </div>
-                ))}
-                {chatThinking && (
-                  <div className="kmk-typing">
-                    <span></span><span></span><span></span>
-                  </div>
-                )}
-                <div ref={messagesEndRef} />
-              </div>
-
-              <div className="kmk-suggest-row">
-                <div className="kmk-suggest" onClick={() => handleSendMessage("What careers suit someone who likes machine learning?")}>ML Careers</div>
-                <div className="kmk-suggest" onClick={() => handleSendMessage("What is the bias variance trade-off in machine learning?")}>Bias & Variance</div>
-                <div className="kmk-suggest" onClick={() => handleSendMessage("How does K-Nearest Neighbour classification work?")}>How KNN works</div>
-              </div>
-
-              <div className="kmk-input-row">
-                <textarea
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  placeholder="Ask a career question or request ML concepts explanation..."
-                  rows="2"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSendMessage(chatInput);
-                    }
-                  }}
-                />
-                <button className="kmk-send" onClick={() => handleSendMessage(chatInput)} disabled={!chatInput.trim() || chatThinking}>
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1a1200" strokeWidth="2.3">
-                    <line x1="22" y1="2" x2="11" y2="13" />
-                    <polygon points="22 2 15 22 11 13 2 9 22 2" />
+            <div className="kmk-chat-container">
+              {/* ChatGPT-style Conversations Sidebar */}
+              <div className="kmk-chat-sidebar">
+                <button className="kmk-chat-new-btn" onClick={handleNewChat}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
                   </svg>
+                  <span>New Chat</span>
                 </button>
+
+                <div className="kmk-conv-section-label">Chat History</div>
+
+                <div className="kmk-conv-list">
+                  {loadingConversations ? (
+                    <div className="kmk-conv-loading">Loading conversations...</div>
+                  ) : conversations.length === 0 ? (
+                    <div className="kmk-conv-empty">No previous chats. Start a new conversation!</div>
+                  ) : (
+                    conversations.map((c) => (
+                      <div
+                        key={c.id}
+                        className={`kmk-conv-item ${c.id === chatConversationId ? "active" : ""}`}
+                        onClick={() => handleSelectConversation(c.id)}
+                      >
+                        <svg className="kmk-conv-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                        </svg>
+                        <span className="kmk-conv-title" title={c.title}>{c.title}</span>
+                        <button
+                          className="kmk-conv-del"
+                          title="Delete Chat"
+                          onClick={(e) => handleDeleteConversation(e, c.id)}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Chat Messages & Input Area */}
+              <div className="kmk-chat-content">
+                <div className="kmk-messages">
+                  {chatMessages.map((m, i) => (
+                    <div key={i} className={`kmk-msg ${m.role === "bot" ? "bot" : "user"}`}>
+                      <div dangerouslySetInnerHTML={{
+                        __html: m.text
+                          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                          .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+                          .replace(/\n/g, "<br />")
+                      }} />
+                    </div>
+                  ))}
+                  {chatThinking && (
+                    <div className="kmk-typing">
+                      <span></span><span></span><span></span>
+                    </div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
+
+                <div className="kmk-suggest-row">
+                  <div className="kmk-suggest" onClick={() => handleSendMessage("What careers suit someone who likes machine learning?")}>ML Careers</div>
+                  <div className="kmk-suggest" onClick={() => handleSendMessage("What is the bias variance trade-off in machine learning?")}>Bias & Variance</div>
+                  <div className="kmk-suggest" onClick={() => handleSendMessage("How does K-Nearest Neighbour classification work?")}>How KNN works</div>
+                </div>
+
+                <div className="kmk-input-row">
+                  <textarea
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder="Ask a career question or request ML concepts explanation..."
+                    rows="2"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSendMessage(chatInput);
+                      }
+                    }}
+                  />
+                  <button className="kmk-send" onClick={() => handleSendMessage(chatInput)} disabled={!chatInput.trim() || chatThinking}>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1a1200" strokeWidth="2.3">
+                      <line x1="22" y1="2" x2="11" y2="13" />
+                      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                    </svg>
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -704,14 +1183,29 @@ export default function App() {
                 <div className="kmk-loading-msg">Fetching live demand signals...</div>
               ) : market ? (
                 <div>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+                    <div style={{ fontSize: "12px", color: "var(--ink-2)", display: "flex", alignItems: "center", gap: 6 }}>
+                      <span className="dot" style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--teal-bright)", display: "inline-block", boxShadow: "0 0 6px var(--teal-bright)" }}></span>
+                      <span>Live Data Source: <b>{market.source || "Remotive & Global Remote API"}</b></span>
+                    </div>
+                    <button
+                      onClick={fetchMarket}
+                      className="kmk-header-btn"
+                      style={{ fontSize: "11px", padding: "5px 10px" }}
+                      title="Refresh live job signals"
+                    >
+                      ↻ Refresh Signals
+                    </button>
+                  </div>
+
                   <div className="kmk-grid">
-                    <div className="kmk-card"><h4>Active Job Signals</h4><div className="big">{market.summary.activeJobSignals}</div><div className="trend up">▲ 6.4% this cycle</div></div>
-                    <div className="kmk-card"><h4>Avg. Entry Salary</h4><div className="big">{market.summary.avgEntrySalary}</div><div className="trend up">▲ 3.2% YoY</div></div>
+                    <div className="kmk-card"><h4>Active Job Signals</h4><div className="big">{market.summary.activeJobSignals}</div><div className="trend up">▲ live hiring</div></div>
+                    <div className="kmk-card"><h4>Avg. Entry Salary</h4><div className="big">{market.summary.avgEntrySalary}</div><div className="trend up">▲ 4.1% YoY</div></div>
                     <div className="kmk-card"><h4>Automation Risk</h4><div className="big">{market.summary.automationRiskAvg}</div><div className="trend down">▼ low probability</div></div>
                     <div className="kmk-card"><h4>Skill Gap Alerts</h4><div className="big">{market.summary.skillGapAlerts}</div><div className="trend up">active targets</div></div>
                   </div>
 
-                  <div className="kmk-section-title"><span className="bar"></span>Top Roles in Demand</div>
+                  <div className="kmk-section-title"><span className="bar"></span>Top Roles in Demand (Live Market Share)</div>
                   <div>
                     {market.topRoles.map((r, i) => (
                       <div key={i} className="kmk-role-row">
@@ -721,7 +1215,7 @@ export default function App() {
                           <div className="kmk-role-bar-fill" style={{ width: `${r.demandScore}%` }} />
                         </div>
                         <div className="kmk-role-pct">{r.demandScore}%</div>
-                        <div style={{ fontSize: "11px", color: "var(--teal-bright)", width: 44, textAlign: "right" }}>{r.trend}</div>
+                        <div style={{ fontSize: "11px", color: "var(--teal-bright)", width: 48, textAlign: "right" }}>{r.trend}</div>
                       </div>
                     ))}
                   </div>
@@ -732,6 +1226,38 @@ export default function App() {
                       <div key={i} className="kmk-suggest">{s}</div>
                     ))}
                   </div>
+
+                  {market.liveOpenings?.length > 0 && (
+                    <div style={{ marginTop: 24 }}>
+                      <div className="kmk-section-title"><span className="bar"></span>Active Live Openings (Direct from Remotive Feed)</div>
+                      <div className="kmk-file-list" style={{ marginTop: 12 }}>
+                        {market.liveOpenings.map((job, idx) => (
+                          <div key={idx} className="kmk-file-row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+                              <div className="kmk-file-icon" style={{ background: "rgba(42,157,143,0.15)", color: "var(--teal-bright)", fontSize: "11px", fontWeight: 700 }}>
+                                {job.company ? job.company.slice(0, 3).toUpperCase() : "JOB"}
+                              </div>
+                              <div className="kmk-file-meta">
+                                <div className="kmk-file-name" style={{ fontWeight: 600 }}>{job.title}</div>
+                                <div className="kmk-file-sub">{job.company} · {job.location}</div>
+                              </div>
+                            </div>
+                            {job.url && job.url !== "#" && (
+                              <a
+                                href={job.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="kmk-header-btn"
+                                style={{ fontSize: "11.5px", padding: "6px 14px", textDecoration: "none", color: "var(--gold)", whiteSpace: "nowrap" }}
+                              >
+                                View Job ↗
+                              </a>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="kmk-error-msg">Failed to load market snapshot.</div>
